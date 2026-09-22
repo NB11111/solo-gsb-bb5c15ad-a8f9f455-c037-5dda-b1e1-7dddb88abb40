@@ -9,7 +9,9 @@
    把唯一的有理数解放大、约分得到 **最小互质正整数系数**；
 4. `/balance/variants` 在自由变量不超过 3 个时，枚举零空间内所有
    `1..max_coefficient` 的互质正整数配平方案；
-5. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+5. `/stoichiometry/batch` 在唯一配平之上，用 `Decimal` 精确计算反应进度、
+   并列限量试剂、各反应物消耗/剩余与各生成物理论产量；
+6. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -38,6 +40,15 @@ docker compose up --build -d
 docker compose down
 ```
 
+启动后可直接调用批量计量接口（宿主机端口 **8000**）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"reactants":["CH4","O2"],"products":["CO2","H2O"],
+       "amounts":[{"species":"CH4","moles":"1"},{"species":"O2","moles":"3"}]}'
+```
+
 ### 不用 Docker 的本地运行方式
 
 ```bash
@@ -50,7 +61,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 107 个测试
+pytest          # 138 个测试
 ```
 
 ---
@@ -62,6 +73,7 @@ pytest          # 107 个测试
 | POST | `/api/v1/balance` | 配平反应，返回最小正整数系数与电荷守恒结果 |
 | POST | `/api/v1/balance/variants` | 枚举自由变量 ≤3 时所有互质正整数配平方案 |
 | POST | `/api/v1/analyze` | 逐元素差异说明：配平前（单位系数）与配平后两个视图 |
+| POST | `/api/v1/stoichiometry/batch` | 投料摩尔数批量计量：反应进度、并列限量试剂、消耗/剩余与理论产量 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -209,7 +221,81 @@ curl -X POST http://localhost:8000/api/v1/balance/variants \
 `reaction_id` 与 `/balance`、`/analyze` 采用同一规范化签名（变体结果不写
 入幂等缓存）。
 
-### 2.4 幂等与查询
+### 2.4 批量限量试剂计量 `POST /api/v1/stoichiometry/batch`
+
+在唯一配平的基础上，给出每种**反应物的投料摩尔数**，服务端以精确十进制
+（`Decimal`，全程不经过 `float`）计算：
+
+* 反应进度 ξ = min(**投料量 ÷ 配平系数**)；
+* **全部并列限量试剂**——当投料恰好按系数比时可能多于一种（全部投料为 0 时全部限量）；
+* 每种反应物的投料量 `fed`、消耗量 `consumed = ξ·系数` 与剩余量
+  `remaining = fed − consumed`；
+* 每种生成物的理论产量 `theoretical_yield = ξ·系数`。
+
+请求体在 `reactants` / `products` 之外增加 `amounts`，**每种规范化反应物
+恰好一条记录**（等价写法可识别，但不能缺失、重复或出现未知物种）；
+摩尔数必须是**非负十进制字符串**（不要传 JSON 数字，以避免浮点误差）：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reactants": ["CH4", "O2"],
+    "products": ["CO2", "H2O"],
+    "amounts": [
+      {"species": "CH4", "moles": "1"},
+      {"species": "O2",  "moles": "3"}
+    ]
+  }'
+```
+
+`200` 响应（十进制值均为字符串；物种按规范化顺序排列，调换书写顺序结果不变）：
+
+```json
+{
+  "reaction_id": "rxn_……",
+  "cached": false,
+  "normalized": {
+    "reactants": ["CH4", "O2"],
+    "products": ["CO2", "H2O"],
+    "equation": "CH4 + 2O2 -> CO2 + 2H2O"
+  },
+  "reaction_extent": {"value": "1", "unit": "mol"},
+  "limiting_reactants": ["CH4"],
+  "reactants": [
+    {"input": "CH4", "normalized": "CH4", "coefficient": 1,
+     "fed": "1", "consumed": "1", "remaining": "0", "is_limiting": true},
+    {"input": "O2", "normalized": "O2", "coefficient": 2,
+     "fed": "3", "consumed": "2", "remaining": "1", "is_limiting": false}
+  ],
+  "products": [
+    {"input": "CO2", "normalized": "CO2", "coefficient": 1, "theoretical_yield": "1"},
+    {"input": "H2O", "normalized": "H2O", "coefficient": 2, "theoretical_yield": "2"}
+  ]
+}
+```
+
+投料比恰好等于系数比（如 `CH4=2.5, O2=5`）时 `limiting_reactants` 同时返回
+`["CH4", "O2"]`，二者 `remaining` 都是 `"0"`。
+
+**无限小数**（分母含 2、5 以外的因子，如 ξ = 1/7）按 **28 位有效数字**
+银行家舍入输出，例如 `"0.1428571428571428571428571429"`；有限小数给出精确值。
+
+错误沿用统一结构化格式：
+
+| 场景 | HTTP / code |
+| --- | --- |
+| 反应式或投料物种无法解析 | `400 FORMULA_PARSE_ERROR` |
+| 反应式同侧物种重复 | `409 DUPLICATE_SPECIES` |
+| 投料缺失、重复、含未知物种（详情在 `details.missing/duplicate/unknown`） | `422 INVALID_REQUEST` |
+| 摩尔数非法：负数、`NaN`、`Infinity`、非数字字符串或 JSON 数字（详情 `details.invalid_moles`） | `422 INVALID_REQUEST` |
+| 反应无法唯一配平 / 无法配平 | `422 NON_UNIQUE_BALANCE` / `IMPOSSIBLE_BALANCE` 等 |
+
+`reaction_id` 与 `/balance`、`/analyze` 共享同一规范化签名——同一反应调换
+反应物 / 生成物书写顺序或使用等价化学式，得到相同的 `reaction_id` 与完全
+一致的计算结果（仅 `input` 字段回显原始写法）。
+
+### 2.5 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -281,7 +367,7 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
 | `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100） |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100）；`/stoichiometry/batch` 投料缺失、重复、含未知物种或摩尔数非法（含 JSON 数字） |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
@@ -307,13 +393,14 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 
 ```
 app/
-  parser.py    递归下降化学式解析（元素/括号/电荷/电子）
-  balancer.py  守恒矩阵、有理数 RREF、零空间、最小正整数、多变体枚举、守恒视图
-  cache.py     规范化签名（SHA-256）与 LRU 幂等缓存
-  service.py   业务编排与响应组装
-  models.py    Pydantic 请求/响应模型
-  main.py      FastAPI 路由与异常处理
-tests/         解析器、配平核心、HTTP API 共 107 个测试
+  parser.py         递归下降化学式解析（元素/括号/电荷/电子）
+  balancer.py       守恒矩阵、有理数 RREF、零空间、最小正整数、多变体枚举、守恒视图
+  cache.py          规范化签名（SHA-256）与 LRU 幂等缓存
+  stoichiometry.py  投料量 -> 反应进度、并列限量试剂、消耗/剩余、理论产量（Decimal 精确计算）
+  service.py        业务编排与响应组装
+  models.py         Pydantic 请求/响应模型
+  main.py           FastAPI 路由与异常处理
+tests/              解析器、配平核心、HTTP API、批量计量共 138 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

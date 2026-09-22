@@ -144,3 +144,75 @@ class VariantsResponse(BaseModel):
     total: int = Field(description="枚举到的全部方案数（截取前）")
     truncated: bool = Field(description="方案总数超过 limit、已截取时为 true")
     variants: list[VariantItem]
+
+
+# ------------------------------------------------------------ 限量试剂计量
+class StoichAmount(BaseModel):
+    species: str = Field(
+        ...,
+        min_length=1,
+        description="反应物化学式；必须与规范化后的反应物一一对应（等价写法可识别）",
+        examples=["H2"],
+    )
+    moles: str = Field(
+        ...,
+        min_length=1,
+        description="投料摩尔数的非负十进制字符串（如 \"1.5\"、\"0\"、\"1e-3\"），"
+        "不要传 JSON 数字以避免浮点误差",
+        examples=["2.0"],
+    )
+
+    @field_validator("species", "moles")
+    @classmethod
+    def _strip_text(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("不能为空白字符串")
+        return stripped
+
+
+class StoichiometryRequest(ReactionRequest):
+    """``/stoichiometry/batch`` 请求：反应式 + 每种反应物的投料摩尔数。"""
+
+    amounts: list[StoichAmount] = Field(
+        ...,
+        min_length=1,
+        description="每种反应物一条投料记录；数量必须恰好等于规范化反应物数量，"
+        "且 species 一一对应（无缺失、重复、未知物种）",
+    )
+
+
+class ReactionExtent(BaseModel):
+    value: str = Field(description="反应进度 ξ = min(投料量 ÷ 系数)，十进制字符串")
+    unit: str = Field(default="mol", description="反应进度以 mol 计（按本反应配平式）")
+
+
+class StoichReactantResult(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数配平系数")
+    fed: str = Field(description="投料摩尔数（回显）")
+    consumed: str = Field(description="按反应进度计算的消耗量（mol）")
+    remaining: str = Field(description="剩余量 = 投料 - 消耗（mol）")
+    is_limiting: bool = Field(description="是否为并列限量试剂之一")
+
+
+class StoichProductResult(BaseModel):
+    input: str
+    normalized: str
+    coefficient: int
+    theoretical_yield: str = Field(description="理论产量（mol）")
+
+
+class StoichiometryResponse(BaseModel):
+    reaction_id: str
+    cached: bool = Field(description="配平结果是否命中幂等缓存")
+    normalized: NormalizedReaction
+    reaction_extent: ReactionExtent
+    limiting_reactants: list[str] = Field(
+        description="全部并列限量试剂的规范化化学式（投料比恰好等于系数比时多于一个）"
+    )
+    reactants: list[StoichReactantResult]
+    products: list[StoichProductResult]

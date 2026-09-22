@@ -5,6 +5,8 @@
 * ``POST /balance``          配平并返回最小正整数系数；
 * ``POST /balance/variants`` 枚举零空间内全部互质正整数配平方案；
 * ``POST /analyze``          逐元素差异说明（配平前 + 配平后视图）；
+* ``POST /stoichiometry/batch`` 投料摩尔数 -> 反应进度、并列限量试剂、
+  各反应物消耗/剩余与各生成物理论产量；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -20,6 +22,8 @@ from .models import (
     AnalyzeResponse,
     BalanceResponse,
     ReactionRequest,
+    StoichiometryResponse,
+    StoichiometryRequest,
     VariantRequest,
     VariantsResponse,
 )
@@ -28,6 +32,7 @@ from .service import (
     get_reaction,
     process_analyze,
     process_balance,
+    process_stoichiometry,
     process_variants,
 )
 
@@ -100,6 +105,26 @@ async def balance_variants(request: VariantRequest):
 )
 async def analyze(request: ReactionRequest):
     status, payload = process_analyze(request.reactants, request.products)
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/stoichiometry/batch",
+    response_model=StoichiometryResponse,
+    tags=["计量"],
+    summary="批量限量试剂计量：反应进度、消耗/剩余与理论产量",
+    responses={
+        400: {"description": "化学式解析失败"},
+        409: {"description": "同侧重复物种 / 投料重复"},
+        422: {"description": "无法唯一配平 / 投料与反应物不对应 / 摩尔数非法"},
+    },
+)
+async def stoichiometry_batch(request: StoichiometryRequest):
+    status, payload = process_stoichiometry(
+        request.reactants,
+        request.products,
+        [item.model_dump() for item in request.amounts],
+    )
     return JSONResponse(status_code=status, content=payload)
 
 

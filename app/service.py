@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .balancer import (
@@ -15,7 +16,8 @@ from .balancer import (
     solve_reaction,
 )
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
-from .parser import FormulaError
+from .parser import FormulaError, parse_formula
+from .stoichiometry import compute_stoichiometry, parse_moles
 
 
 # 错误码 -> HTTP 状态码
@@ -392,4 +394,112 @@ def process_variants(
         "total": total,
         "truncated": total > limit,
         "variants": items,
+    }
+
+
+# ------------------------------------------------------------ 限量试剂批量计量
+def process_stoichiometry(
+    reactant_texts: list[str],
+    product_texts: list[str],
+    amount_items: list[dict[str, str]],
+) -> tuple[int, dict[str, Any]]:
+    """限量试剂批量计量，返回 (http_status, payload)。
+
+    先复用 :func:`process_balance` 的唯一配平、规范化与幂等缓存逻辑；
+    配平失败（解析错误、重复物种、不可唯一配平等）沿用其结构化错误响应。
+    随后校验投料与规范化反应物一一对应，并以精确十进制计算反应进度、
+    并列限量试剂、各反应物消耗/剩余与各生成物理论产量。
+    """
+    status, balance_payload = process_balance(reactant_texts, product_texts)
+    if status != 200:
+        return status, balance_payload
+
+    reaction_id = balance_payload["reaction_id"]
+    cached = balance_payload["cached"]
+
+    # 规范化反应物（parse_side 已按规范键排序，与配平向量顺序一致）
+    reactants = list(parse_side(reactant_texts, "反应物"))
+    products = list(parse_side(product_texts, "生成物"))
+    coefficient_map = {
+        species_key(sp): coef
+        for sp, coef in zip(
+            (*reactants, *products), balance_payload["coefficients"]["vector"]
+        )
+    }
+    reactant_keys = {species_key(sp) for sp in reactants}
+
+    # ---- 投料条目：逐条解析物种与摩尔数，聚合所有可定位的问题
+    parsed_entries: list[tuple[str, Species]] = []
+    invalid_moles: list[dict[str, str]] = []
+    feed: dict[str, Decimal] = {}
+    duplicate: list[str] = []
+    seen_keys: set[str] = set()
+
+    for item in amount_items:
+        species_text = item["species"]
+        moles_text = item["moles"]
+        try:
+            formula = parse_formula(species_text)
+        except FormulaError as exc:
+            # 投料物种本身无法解析：沿用化学式解析错误（400）
+            return STATUS_CODES["FORMULA_PARSE_ERROR"], {
+                "reaction_id": reaction_id,
+                "cached": cached,
+                "error": error_payload(
+                    "FORMULA_PARSE_ERROR",
+                    str(exc),
+                    {"field": "amounts.species", "input": species_text},
+                ),
+            }
+        sp = Species(raw=species_text, normalized=formula.normalized, formula=formula)
+        key = species_key(sp)
+
+        if key in seen_keys:
+            duplicate.append(formula.normalized)
+        seen_keys.add(key)
+
+        try:
+            amount = parse_moles(moles_text)
+        except (ValueError, InvalidOperation):
+            invalid_moles.append({"species": formula.normalized, "moles": moles_text})
+        else:
+            parsed_entries.append((moles_text, sp))
+            feed.setdefault(key, amount)
+
+    unknown = sorted(
+        {sp.normalized for _, sp in parsed_entries if species_key(sp) not in reactant_keys}
+    )
+    provided_keys = {species_key(sp) for _, sp in parsed_entries}
+    normalized_by_key = {species_key(sp): sp.normalized for sp in reactants}
+    missing = [
+        normalized_by_key[key] for key in reactant_keys if key not in provided_keys
+    ]
+
+    if duplicate or unknown or missing or invalid_moles:
+        details: dict[str, Any] = {}
+        if missing:
+            details["missing"] = sorted(missing)
+        if duplicate:
+            details["duplicate"] = sorted(set(duplicate))
+        if unknown:
+            details["unknown"] = unknown
+        if invalid_moles:
+            details["invalid_moles"] = invalid_moles
+        return STATUS_CODES["INVALID_REQUEST"], {
+            "reaction_id": reaction_id,
+            "cached": cached,
+            "error": error_payload(
+                "INVALID_REQUEST",
+                "投料记录必须与规范化反应物一一对应：不能有缺失、重复或未知物种，"
+                "且每条摩尔数必须是非负十进制字符串（不能为 JSON 数字）",
+                details,
+            ),
+        }
+
+    result = compute_stoichiometry(reactants, products, coefficient_map, feed)
+    return 200, {
+        "reaction_id": reaction_id,
+        "cached": cached,
+        "normalized": balance_payload["normalized"],
+        **result,
     }
