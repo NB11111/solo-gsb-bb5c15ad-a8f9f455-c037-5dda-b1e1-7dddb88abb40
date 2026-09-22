@@ -9,7 +9,10 @@
    把唯一的有理数解放大、约分得到 **最小互质正整数系数**；
 4. `/balance/variants` 在自由变量不超过 3 个时，枚举零空间内所有
    `1..max_coefficient` 的互质正整数配平方案；
-5. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
+5. `/stoichiometry/batch` 按各反应物的投料摩尔数（非负十进制）计算
+   **反应进度 ξ = min(投料量 ÷ 系数)**，返回全部并列限量试剂、每种反应物的
+   消耗/剩余量与每种生成物的理论产量，十进制结果一律以字符串返回；
+6. 对同一规范化反应做幂等缓存，重复请求返回相同的 `reaction_id` 与结果。
 
 ---
 
@@ -50,7 +53,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest          # 107 个测试
+pytest          # 132 个测试
 ```
 
 ---
@@ -62,6 +65,7 @@ pytest          # 107 个测试
 | POST | `/api/v1/balance` | 配平反应，返回最小正整数系数与电荷守恒结果 |
 | POST | `/api/v1/balance/variants` | 枚举自由变量 ≤3 时所有互质正整数配平方案 |
 | POST | `/api/v1/analyze` | 逐元素差异说明：配平前（单位系数）与配平后两个视图 |
+| POST | `/api/v1/stoichiometry/batch` | 按投料量计算反应进度、并列限量试剂、消耗/剩余与理论产量 |
 | GET | `/api/v1/reactions/{reaction_id}` | 按幂等 ID 取回之前的结果 |
 | GET | `/health` | 健康检查 |
 
@@ -209,7 +213,68 @@ curl -X POST http://localhost:8000/api/v1/balance/variants \
 `reaction_id` 与 `/balance`、`/analyze` 采用同一规范化签名（变体结果不写
 入幂等缓存）。
 
-### 2.4 幂等与查询
+### 2.4 投料计量 `POST /api/v1/stoichiometry/batch`
+
+先复用与 `/balance` 相同的解析、规范化与唯一配平逻辑，再按每个反应物的
+**非负十进制投料摩尔数** 计算：
+
+* 反应进度 `extent`：`ξ = min(投料量 ÷ 系数)`；
+* `limiting_reactants`：达到最小值的**全部**并列限量试剂；
+* 每种反应物的 `fed` / `consumed` / `remaining`（投料 / 消耗 / 剩余）；
+* 每种生成物的 `theoretical_yield`（理论产量）。
+
+`feeds` 与规范化后的反应物**一一对应**（顺序无关；写法可与 `reactants`
+不同，如 `Ca[OH]2` 对应 `Ca(OH)2`）：缺失或出现不属于反应物的物种返回
+`422 INVALID_REQUEST`，投料列表内部重复返回 `409 DUPLICATE_SPECIES`，
+反应无法唯一配平沿用 `NON_UNIQUE_BALANCE` 等结构化错误。所有十进制结果
+以**字符串**返回（内部用精确有理数计算、按 28 位有效数字正确舍入），
+不会出现 `0.30000000000000004` 之类的浮点误差。`reaction_id` 与
+`/balance` 同一签名：同一反应书写顺序变化后，`reaction_id` 与计算结果
+完全一致（投料结果依赖投料量，不写入幂等缓存）。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stoichiometry/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "reactants": ["N2", "H2"],
+        "products": ["NH3"],
+        "feeds": [
+          {"species": "N2", "moles": "2"},
+          {"species": "H2", "moles": "9.6"}
+        ]
+      }'
+```
+
+`200` 响应：
+
+```json
+{
+  "reaction_id": "rxn_e5e15661b122a788",
+  "normalized": {
+    "reactants": ["H2", "N2"],
+    "products": ["NH3"],
+    "equation": "3H2 + N2 -> 2NH3"
+  },
+  "extent": "2",
+  "limiting_reactants": ["N2"],
+  "reactants": [
+    {"input": "H2", "normalized": "H2", "coefficient": 3,
+     "fed": "9.6", "consumed": "6", "remaining": "3.6", "limiting": false},
+    {"input": "N2", "normalized": "N2", "coefficient": 1,
+     "fed": "2", "consumed": "2", "remaining": "0", "limiting": true}
+  ],
+  "products": [
+    {"input": "NH3", "normalized": "NH3", "coefficient": 2,
+     "theoretical_yield": "4"}
+  ]
+}
+```
+
+> `moles` 接受字符串或 JSON 数字；涉及小数时建议传字符串（如 `"0.1"`）
+> 以保证精度。摩尔数须为非负十进制（拒绝负数、`NaN`、`Infinity`），
+> 数量级须在 1e-30 ～ 1e30 之间。
+
+### 2.5 幂等与查询
 
 * 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
   物种的 **（元素组成多重集, 电荷）**。
@@ -280,8 +345,8 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 | code | HTTP | 含义 |
 | --- | --- | --- |
 | `FORMULA_PARSE_ERROR` | 400 | 化学式无法解析（未知元素、括号不匹配、电荷非法等） |
-| `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种 |
-| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100） |
+| `DUPLICATE_SPECIES` | 409 | 同一侧出现重复物种（含 `/stoichiometry/batch` 投料列表内重复） |
+| `INVALID_REQUEST` | 422 | 请求体缺失/为空/物种过多（>100），或投料缺失、含未知物种、摩尔数非法 |
 | `IMPOSSIBLE_BALANCE` | 422 | 守恒方程组无解（含电荷无法守恒） |
 | `NON_UNIQUE_BALANCE` | 422 | 零空间维数 > 1，配平不唯一（返回 `nullity` 与自由度） |
 | `ZERO_COEFFICIENT` | 422 | 唯一解要求某些物种系数为 0 |
@@ -309,11 +374,12 @@ LCM），热循环只剩整数乘加；自由变量最多 3 个、系数上限 3
 app/
   parser.py    递归下降化学式解析（元素/括号/电荷/电子）
   balancer.py  守恒矩阵、有理数 RREF、零空间、最小正整数、多变体枚举、守恒视图
+  stoichiometry.py  投料计量：反应进度、并列限量试剂、消耗/剩余与理论产量
   cache.py     规范化签名（SHA-256）与 LRU 幂等缓存
   service.py   业务编排与响应组装
   models.py    Pydantic 请求/响应模型
   main.py      FastAPI 路由与异常处理
-tests/         解析器、配平核心、HTTP API 共 107 个测试
+tests/         解析器、配平核心、HTTP API 共 132 个测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -144,3 +145,76 @@ class VariantsResponse(BaseModel):
     total: int = Field(description="枚举到的全部方案数（截取前）")
     truncated: bool = Field(description="方案总数超过 limit、已截取时为 true")
     variants: list[VariantItem]
+
+
+# ------------------------------------------------------------ 投料计量
+class FeedEntry(BaseModel):
+    species: str = Field(
+        ...,
+        description="投料反应物的化学式；写法可与 reactants 不同，规范化后须一一对应",
+        examples=["H2"],
+    )
+    moles: Decimal = Field(
+        ...,
+        ge=0,
+        allow_inf_nan=False,
+        description="非负十进制摩尔数；建议用字符串传入以保证精度，如 \"2.5\"",
+        examples=["2.5"],
+    )
+
+    @field_validator("species")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("化学式必须是字符串")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("化学式不能为空字符串")
+        return stripped
+
+    @field_validator("moles")
+    @classmethod
+    def _scale_guard(cls, value: Decimal) -> Decimal:
+        if value and abs(value.adjusted()) > 30:
+            raise ValueError("摩尔数的数量级须在 1e-30 ～ 1e30 之间")
+        return value
+
+
+class StoichiometryRequest(ReactionRequest):
+    """``/stoichiometry/batch`` 请求：反应式 + 每个反应物的投料摩尔数。"""
+
+    feeds: list[FeedEntry] = Field(
+        ...,
+        description="每个反应物的投料量；与规范化反应物一一对应（顺序无关，"
+        "缺失、重复或不属于反应物的物种都会报错）",
+    )
+
+
+class ReactantAmountOut(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数系数")
+    fed: str = Field(description="投料摩尔数（十进制字符串）")
+    consumed: str = Field(description="消耗摩尔数（十进制字符串）")
+    remaining: str = Field(description="剩余摩尔数（十进制字符串）")
+    limiting: bool = Field(description="是否为（并列）限量试剂")
+
+
+class ProductYieldOut(BaseModel):
+    input: str = Field(description="客户端提交的原始化学式")
+    normalized: str = Field(description="规范化后的化学式")
+    coefficient: int = Field(description="最小互质正整数系数")
+    theoretical_yield: str = Field(description="理论产量摩尔数（十进制字符串）")
+
+
+class StoichiometryResponse(BaseModel):
+    reaction_id: str
+    normalized: NormalizedReaction
+    extent: str = Field(
+        description="反应进度 ξ = min(投料量 ÷ 系数)，单位 mol（十进制字符串）"
+    )
+    limiting_reactants: list[str] = Field(
+        description="全部并列限量试剂的规范化化学式（按规范化反应物顺序）"
+    )
+    reactants: list[ReactantAmountOut]
+    products: list[ProductYieldOut]

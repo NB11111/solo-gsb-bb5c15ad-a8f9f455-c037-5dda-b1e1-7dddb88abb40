@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from .balancer import (
@@ -15,7 +16,8 @@ from .balancer import (
     solve_reaction,
 )
 from .cache import ReactionRecord, build_signature, cache, reaction_id_for, species_key
-from .parser import FormulaError
+from .parser import FormulaError, parse_formula
+from .stoichiometry import compute_stoichiometry, decimal_text
 
 
 # 错误码 -> HTTP 状态码
@@ -317,8 +319,6 @@ def get_reaction(reaction_id: str) -> dict[str, Any] | None:
 
 def _record_species(record: ReactionRecord, attr: str) -> list[Species]:
     """缓存里只存了 normalized 文本；查询回显时构造轻量 Species。"""
-    from .parser import parse_formula
-
     return [
         Species(
             raw=item["normalized"],
@@ -393,3 +393,130 @@ def process_variants(
         "truncated": total > limit,
         "variants": items,
     }
+
+
+# ------------------------------------------------------------ 投料计量
+def process_stoichiometry_batch(
+    reactant_texts: list[str],
+    product_texts: list[str],
+    feed_entries: list[tuple[str, Decimal]],
+) -> tuple[int, dict[str, Any]]:
+    """投料计量入口，返回 (http_status, payload)。
+
+    复用 /balance 的解析、规范化与唯一配平逻辑，再以精确有理数（Decimal
+    入参）计算反应进度与物料衡算。结果依赖投料量，不写幂等缓存，但
+    reaction_id 与 /balance 使用同一规范化签名：同一反应无论书写顺序
+    如何变化，reaction_id 与计算结果都一致。
+    """
+    try:
+        reactants, products = _parse_all(reactant_texts, product_texts)
+    except BalanceError as exc:
+        # 解析 / 去重阶段失败：沿用与 /balance 一致的退化签名生成 ID
+        reaction_id = reaction_id_for(
+            _text_signature(reactant_texts, product_texts)
+        )
+        return STATUS_CODES[exc.code], {
+            "error": error_payload(exc.code, exc.message, dict(exc.details)),
+            "reaction_id": reaction_id,
+        }
+
+    signature = build_signature(reactants, products)
+    reaction_id = reaction_id_for(signature)
+
+    try:
+        feed_map = _match_feeds(reactants, feed_entries)
+        solved = solve_reaction(reactant_texts, product_texts)
+    except BalanceError as exc:
+        return STATUS_CODES[exc.code], {
+            "error": error_payload(exc.code, exc.message, dict(exc.details)),
+            "reaction_id": reaction_id,
+        }
+
+    feeds = [feed_map[sp.formula.key] for sp in solved.reactants]
+    result = compute_stoichiometry(
+        list(solved.reactant_coefficients),
+        list(solved.product_coefficients),
+        feeds,
+    )
+    coefficient_map = _coef_map(solved)
+
+    return 200, {
+        "reaction_id": reaction_id,
+        "normalized": _normalized_block(
+            list(solved.reactants), list(solved.products), coefficient_map
+        ),
+        "extent": decimal_text(result.extent),
+        "limiting_reactants": [
+            sp.normalized
+            for sp, amount in zip(solved.reactants, result.reactants)
+            if amount.limiting
+        ],
+        "reactants": [
+            {
+                "input": sp.raw,
+                "normalized": sp.normalized,
+                "coefficient": amount.coefficient,
+                "fed": decimal_text(amount.fed),
+                "consumed": decimal_text(amount.consumed),
+                "remaining": decimal_text(amount.remaining),
+                "limiting": amount.limiting,
+            }
+            for sp, amount in zip(solved.reactants, result.reactants)
+        ],
+        "products": [
+            {
+                "input": sp.raw,
+                "normalized": sp.normalized,
+                "coefficient": coefficient_map[species_key(sp)],
+                "theoretical_yield": decimal_text(yield_),
+            }
+            for sp, yield_ in zip(solved.products, result.product_yields)
+        ],
+    }
+
+
+def _match_feeds(
+    reactants: list[Species],
+    feed_entries: list[tuple[str, Decimal]],
+) -> dict[tuple, Decimal]:
+    """把投料条目按规范键（组成 + 电荷）映射到规范化反应物。
+
+    投料物种的写法可与 reactants 不同（括号风格、空白、电荷写法等价即
+    可），但必须与规范化反应物一一对应：重复条目报 DUPLICATE_SPECIES，
+    不属于反应物或缺失反应物报 INVALID_REQUEST。
+    """
+    feeds: dict[tuple, Decimal] = {}
+    normalized_by_key: dict[tuple, str] = {}
+    for text, moles in feed_entries:
+        try:
+            formula = parse_formula(text)
+        except FormulaError as exc:
+            raise BalanceError("FORMULA_PARSE_ERROR", str(exc)) from exc
+        if formula.key in feeds:
+            raise BalanceError(
+                "DUPLICATE_SPECIES",
+                f"投料列表中存在重复物种：{formula.normalized}",
+                species=formula.normalized,
+                side="feeds",
+            )
+        feeds[formula.key] = moles
+        normalized_by_key[formula.key] = formula.normalized
+
+    reactant_keys = {sp.formula.key for sp in reactants}
+    unknown = sorted(
+        normalized_by_key[key] for key in feeds if key not in reactant_keys
+    )
+    if unknown:
+        raise BalanceError(
+            "INVALID_REQUEST",
+            f"投料物种不是该反应的反应物：{', '.join(unknown)}",
+            unknown_species=unknown,
+        )
+    missing = [sp.normalized for sp in reactants if sp.formula.key not in feeds]
+    if missing:
+        raise BalanceError(
+            "INVALID_REQUEST",
+            f"缺少反应物的投料量：{', '.join(missing)}",
+            missing_species=missing,
+        )
+    return feeds

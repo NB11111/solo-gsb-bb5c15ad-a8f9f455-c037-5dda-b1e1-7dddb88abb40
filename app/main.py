@@ -5,6 +5,7 @@
 * ``POST /balance``          配平并返回最小正整数系数；
 * ``POST /balance/variants`` 枚举零空间内全部互质正整数配平方案；
 * ``POST /analyze``          逐元素差异说明（配平前 + 配平后视图）；
+* ``POST /stoichiometry/batch`` 按投料量计算反应进度、限量试剂与理论产量；
 * ``GET  /reactions/{reaction_id}``  按幂等 ID 取回结果；
 * ``GET  /health``   健康检查。
 """
@@ -12,6 +13,7 @@
 from __future__ import annotations
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -20,6 +22,8 @@ from .models import (
     AnalyzeResponse,
     BalanceResponse,
     ReactionRequest,
+    StoichiometryRequest,
+    StoichiometryResponse,
     VariantRequest,
     VariantsResponse,
 )
@@ -28,6 +32,7 @@ from .service import (
     get_reaction,
     process_analyze,
     process_balance,
+    process_stoichiometry_batch,
     process_variants,
 )
 
@@ -49,7 +54,8 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
             "error": {
                 "code": "INVALID_REQUEST",
                 "message": "请求体校验失败：请提供非空的 reactants 与 products 字符串数组",
-                "details": {"validation": exc.errors()},
+                # jsonable_encoder：Decimal 等校验上下文值需要转换为可 JSON 序列化的形式
+                "details": {"validation": jsonable_encoder(exc.errors())},
             }
         },
     )
@@ -100,6 +106,23 @@ async def balance_variants(request: VariantRequest):
 )
 async def analyze(request: ReactionRequest):
     status, payload = process_analyze(request.reactants, request.products)
+    return JSONResponse(status_code=status, content=payload)
+
+
+@app.post(
+    "/api/v1/stoichiometry/batch",
+    response_model=StoichiometryResponse,
+    tags=["计量"],
+    summary="按投料量计算反应进度、限量试剂与理论产量",
+    responses={400: {"description": "化学式解析失败"}, 409: {"description": "投料物种重复"},
+               422: {"description": "无法唯一配平 / 投料缺失或未知 / 请求非法"}},
+)
+async def stoichiometry_batch(request: StoichiometryRequest):
+    status, payload = process_stoichiometry_batch(
+        request.reactants,
+        request.products,
+        [(feed.species, feed.moles) for feed in request.feeds],
+    )
     return JSONResponse(status_code=status, content=payload)
 
 
